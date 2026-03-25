@@ -7,13 +7,10 @@ Works by acting as a transparent scdaemon proxy -- gpg-agent launches it instead
 ## Install
 
 ```bash
-# Download the latest release
-curl -fSL https://github.com/bdtfs/yubikey-notifier/releases/latest/download/yubikey-notifier -o /usr/local/bin/yubikey-notifier
-chmod +x /usr/local/bin/yubikey-notifier
-
-# Configure as scdaemon wrapper
-yubikey-notifier --setup
+curl -fsSL https://raw.githubusercontent.com/bdtfs/yubikey-notifier/main/install.sh | sh
 ```
+
+This detects your Mac's architecture (Apple Silicon or Intel), downloads the correct binary, and configures the scdaemon wrapper automatically.
 
 That's it. The setup command:
 1. Detects your real scdaemon path via `gpgconf`
