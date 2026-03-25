@@ -1,9 +1,12 @@
 use std::io::{BufRead, Write};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::alert::{AlertHandle, Alerter};
 use crate::event::{Event, EventSink};
+use crate::sound::GRACE_PERIOD_MS;
 
 /// Returns true if the line is a command that requires YubiKey touch.
 pub fn is_touch_command(line: &str) -> bool {
@@ -22,6 +25,32 @@ pub fn is_completion(line: &str) -> Option<bool> {
         Some(false)
     } else {
         None
+    }
+}
+
+/// State machine for tracking touch detection with grace period.
+enum TouchState {
+    /// No touch operation in progress.
+    Idle,
+    /// Touch command seen, waiting for grace period before alerting.
+    Pending { since: Instant, command: String },
+    /// Grace period expired, alert is active.
+    Alerting { _handle: AlertHandle },
+}
+
+struct ProxyState {
+    touch: TouchState,
+}
+
+impl ProxyState {
+    fn new() -> Self {
+        Self {
+            touch: TouchState::Idle,
+        }
+    }
+
+    fn is_pending_or_alerting(&self) -> bool {
+        !matches!(self.touch, TouchState::Idle)
     }
 }
 
@@ -46,41 +75,110 @@ pub fn run_proxy<AR, AW, SR, SW>(
     SR: BufRead + Send + 'static,
     SW: Write + Send + 'static,
 {
-    use std::sync::Mutex;
-
-    let alert_handle: Arc<Mutex<Option<AlertHandle>>> = Arc::new(Mutex::new(None));
+    let state = Arc::new((Mutex::new(ProxyState::new()), Condvar::new()));
+    let shutdown = Arc::new(AtomicBool::new(false));
 
     events.emit(Event::ProxyStarted);
 
-    // Forward: agent -> scdaemon
-    let alert_fwd = alert_handle.clone();
-    let alerter_fwd = alerter.clone();
-    let events_fwd = events.clone();
-    let fwd_thread = thread::spawn(move || {
-        let mut writer = scd_write;
-        for line in agent_read.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
+    // Grace period watcher thread
+    let grace_state = state.clone();
+    let grace_alerter = alerter.clone();
+    let grace_events = events.clone();
+    let grace_shutdown = shutdown.clone();
+    let _grace_thread = thread::spawn(move || {
+        let (lock, cvar) = &*grace_state;
+        loop {
+            if grace_shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            let deadline = {
+                let st = lock.lock().unwrap();
+                match &st.touch {
+                    TouchState::Pending { since, .. } => {
+                        *since + Duration::from_millis(GRACE_PERIOD_MS)
+                    }
+                    _ => {
+                        // Wait until notified (state change to Pending)
+                        let st = cvar.wait(st).unwrap();
+                        match &st.touch {
+                            TouchState::Pending { since, .. } => {
+                                *since + Duration::from_millis(GRACE_PERIOD_MS)
+                            }
+                            _ => continue, // Spurious wake or already completed
+                        }
+                    }
+                }
             };
 
+            // Sleep until grace period expires, waking on state changes
+            {
+                let mut st = lock.lock().unwrap();
+                loop {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    if !matches!(st.touch, TouchState::Pending { .. }) {
+                        break; // State changed (completed during grace period)
+                    }
+                    let remaining = deadline - now;
+                    let result = cvar.wait_timeout(st, remaining).unwrap();
+                    st = result.0;
+                }
+
+                // If still pending after grace period, escalate to alerting
+                let cmd = match &st.touch {
+                    TouchState::Pending { command, .. } => Some(command.clone()),
+                    _ => None,
+                };
+                if let Some(command) = cmd {
+                    grace_events.emit(Event::TouchRequired { command });
+                    let handle = grace_alerter.start();
+                    st.touch = TouchState::Alerting { _handle: handle };
+                }
+            }
+        }
+    });
+
+    // Forward: agent -> scdaemon
+    let fwd_state = state.clone();
+    let _events_fwd = events.clone();
+    let _fwd_thread = thread::spawn(move || {
+        let (lock, cvar) = &*fwd_state;
+        let mut writer = scd_write;
+        let mut agent_read = agent_read;
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match agent_read.read_until(b'\n', &mut buf) {
+                Ok(0) => break, // EOF
+                Ok(_) => {}
+                Err(_) => break,
+            }
+
+            // Try to interpret as UTF-8 for touch detection
+            let line_str = String::from_utf8_lossy(&buf);
+            let line_trimmed = line_str.trim_end_matches('\n').trim_end_matches('\r');
+
             #[cfg(debug_assertions)]
-            events_fwd.emit(Event::LineForwarded {
+            _events_fwd.emit(Event::LineForwarded {
                 direction: crate::event::Direction::ToScdaemon,
-                line: line.clone(),
+                line: line_trimmed.to_string(),
             });
 
-            if is_touch_command(&line) {
-                let mut handle = alert_fwd.lock().unwrap();
-                if handle.is_none() {
-                    events_fwd.emit(Event::TouchRequired {
-                        command: line.trim().to_string(),
-                    });
-                    *handle = Some(alerter_fwd.start());
+            if is_touch_command(line_trimmed) {
+                let mut st = lock.lock().unwrap();
+                if !st.is_pending_or_alerting() {
+                    st.touch = TouchState::Pending {
+                        since: Instant::now(),
+                        command: line_trimmed.trim().to_string(),
+                    };
+                    cvar.notify_all();
                 }
             }
 
-            if writeln!(writer, "{}", line).is_err() {
+            // Forward raw bytes (preserving original encoding)
+            if writer.write_all(&buf).is_err() {
                 break;
             }
             if writer.flush().is_err() {
@@ -90,48 +188,82 @@ pub fn run_proxy<AR, AW, SR, SW>(
     });
 
     // Forward: scdaemon -> agent
-    let alert_back = alert_handle.clone();
+    let back_state = state.clone();
+    let back_shutdown = shutdown.clone();
+    let back_alerter = alerter.clone();
     let events_back = events.clone();
     let back_thread = thread::spawn(move || {
+        let (lock, cvar) = &*back_state;
         let mut writer = agent_write;
-        for line in scd_read.lines() {
-            let line = match line {
-                Ok(l) => l,
+        let mut scd_read = scd_read;
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match scd_read.read_until(b'\n', &mut buf) {
+                Ok(0) => break, // EOF
+                Ok(_) => {}
                 Err(_) => break,
-            };
+            }
+
+            let line_str = String::from_utf8_lossy(&buf);
+            let line_trimmed = line_str.trim_end_matches('\n').trim_end_matches('\r');
 
             #[cfg(debug_assertions)]
             events_back.emit(Event::LineForwarded {
                 direction: crate::event::Direction::FromScdaemon,
-                line: line.clone(),
+                line: line_trimmed.to_string(),
             });
 
-            // Check for completion while alert is active
+            // Check for completion while in pending or alerting state
             {
-                let mut handle = alert_back.lock().unwrap();
-                if handle.is_some() {
-                    if let Some(success) = is_completion(&line) {
-                        // Drop the handle to stop the alert
-                        *handle = None;
+                let mut st = lock.lock().unwrap();
+                if st.is_pending_or_alerting() {
+                    if let Some(success) = is_completion(line_trimmed) {
+                        let was_alerting = matches!(st.touch, TouchState::Alerting { .. });
+                        // Reset to idle - drops AlertHandle if alerting (stops sound)
+                        st.touch = TouchState::Idle;
+                        cvar.notify_all();
                         events_back.emit(Event::TouchCompleted { success });
+                        // Play completion sound only if the alert was visible to the user
+                        if was_alerting {
+                            back_alerter.play_completion(success);
+                        }
                     }
                 }
             }
 
-            if writeln!(writer, "{}", line).is_err() {
+            // Forward raw bytes (preserving original encoding)
+            if writer.write_all(&buf).is_err() {
                 break;
             }
             if writer.flush().is_err() {
                 break;
             }
         }
-        // Ensure alert stops if scdaemon disconnects
-        let mut handle = alert_back.lock().unwrap();
-        *handle = None;
+        // scdaemon disconnected - clean up and signal shutdown
+        back_shutdown.store(true, Ordering::Relaxed);
+        let (lock, cvar) = &*back_state;
+        let mut st = lock.lock().unwrap();
+        let was_alerting = matches!(st.touch, TouchState::Alerting { .. });
+        st.touch = TouchState::Idle;
+        cvar.notify_all();
+        // If scdaemon died/disconnected while alert was playing, treat as error
+        if was_alerting {
+            events_back.emit(Event::TouchCompleted { success: false });
+            back_alerter.play_completion(false);
+        }
     });
 
-    let _ = fwd_thread.join();
+    // Wait for either side to close. If scdaemon exits, we're done -
+    // don't block waiting for the agent side (fwd_thread may be stuck
+    // reading from gpg-agent which keeps the pipe open).
     let _ = back_thread.join();
+    // Signal everything to stop
+    shutdown.store(true, Ordering::Relaxed);
+    let (_, cvar) = &*state;
+    cvar.notify_all();
+    // fwd_thread and grace_thread will exit when the process exits
+    // or when their next I/O operation fails.
 }
 
 #[cfg(test)]
@@ -178,8 +310,8 @@ mod tests {
         let scd_input = Cursor::new(b"OK\nOK\n".to_vec());
         let scd_output: Vec<u8> = Vec::new();
 
-        let agent_output = std::sync::Arc::new(std::sync::Mutex::new(agent_output));
-        let scd_output = std::sync::Arc::new(std::sync::Mutex::new(scd_output));
+        let agent_output = Arc::new(Mutex::new(agent_output));
+        let scd_output = Arc::new(Mutex::new(scd_output));
 
         let ao = SharedWriter(agent_output.clone());
         let so = SharedWriter(scd_output.clone());
@@ -200,28 +332,122 @@ mod tests {
     }
 
     #[test]
-    fn proxy_detects_touch_and_completion() {
+    fn proxy_no_alert_on_fast_completion() {
+        // If scdaemon responds OK before grace period, no alert should fire.
+        // Use pipes to control timing: send PKSIGN, wait for it to be processed,
+        // then send OK.
+        use std::io::Write as _;
+
         let (sink, rx) = event::channel();
         let alerter = make_test_alerter(&sink);
 
-        // Simulate: agent sends PKSIGN, scdaemon responds with OK
         let agent_input = Cursor::new(b"PKSIGN --hash=sha256\n".to_vec());
-        let scd_input = Cursor::new(b"OK\n".to_vec());
 
-        let agent_output = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let scd_output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (scd_read_end, mut scd_write_end) = os_pipe::pipe().unwrap();
+        let (_agent_read_end, agent_write_end) = os_pipe::pipe().unwrap();
 
-        run_proxy(
-            agent_input,
-            SharedWriter(agent_output.clone()),
-            scd_input,
-            SharedWriter(scd_output.clone()),
-            alerter,
-            sink,
-        );
+        let sink_clone = sink.clone();
+        let handle = thread::spawn(move || {
+            run_proxy(
+                agent_input,
+                agent_write_end,
+                std::io::BufReader::new(scd_read_end),
+                SharedWriter(Arc::new(Mutex::new(Vec::new()))),
+                alerter,
+                sink_clone,
+            );
+        });
 
-        // Give threads a moment to emit events
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Give fwd_thread time to process PKSIGN and set state to Pending
+        thread::sleep(Duration::from_millis(100));
+
+        // Send fast OK (within grace period)
+        writeln!(scd_write_end, "OK").unwrap();
+        drop(scd_write_end);
+
+        handle.join().unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let events = event::collect_events(rx);
+        assert!(events.contains(&Event::ProxyStarted));
+        assert!(events.contains(&Event::TouchCompleted { success: true }));
+        // No alert should have fired - completion came before grace period
+        assert!(!events.iter().any(|e| matches!(e, Event::AlertStarted)));
+    }
+
+    #[test]
+    fn proxy_no_alert_on_fast_error() {
+        use std::io::Write as _;
+
+        let (sink, rx) = event::channel();
+        let alerter = make_test_alerter(&sink);
+
+        let agent_input = Cursor::new(b"PKDECRYPT\n".to_vec());
+
+        let (scd_read_end, mut scd_write_end) = os_pipe::pipe().unwrap();
+        let (_agent_read_end, agent_write_end) = os_pipe::pipe().unwrap();
+
+        let sink_clone = sink.clone();
+        let handle = thread::spawn(move || {
+            run_proxy(
+                agent_input,
+                agent_write_end,
+                std::io::BufReader::new(scd_read_end),
+                SharedWriter(Arc::new(Mutex::new(Vec::new()))),
+                alerter,
+                sink_clone,
+            );
+        });
+
+        thread::sleep(Duration::from_millis(100));
+
+        writeln!(scd_write_end, "ERR 100 failed").unwrap();
+        drop(scd_write_end);
+
+        handle.join().unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let events = event::collect_events(rx);
+        assert!(events.contains(&Event::TouchCompleted { success: false }));
+        assert!(!events.iter().any(|e| matches!(e, Event::AlertStarted)));
+    }
+
+    #[test]
+    fn proxy_alerts_after_grace_period() {
+        // Use a pipe to control timing - scdaemon doesn't respond until after grace period
+        use std::io::Write as _;
+
+        let (sink, rx) = event::channel();
+        let alerter = make_test_alerter(&sink);
+
+        let agent_input = Cursor::new(b"PKSIGN --hash=sha256\n".to_vec());
+
+        // Use a real pipe for scd_read so we can delay the response
+        let (scd_read_end, mut scd_write_end) = os_pipe::pipe().unwrap();
+        let (_agent_read_pipe, agent_write_pipe) = os_pipe::pipe().unwrap();
+
+        let sink_clone = sink.clone();
+        let handle = thread::spawn(move || {
+            run_proxy(
+                agent_input,
+                agent_write_pipe,
+                std::io::BufReader::new(scd_read_end),
+                SharedWriter(Arc::new(Mutex::new(Vec::new()))),
+                alerter,
+                sink_clone,
+            );
+        });
+
+        // Wait longer than grace period
+        thread::sleep(Duration::from_millis(GRACE_PERIOD_MS + 200));
+
+        // Now send completion
+        writeln!(scd_write_end, "OK").unwrap();
+        drop(scd_write_end); // Close pipe to let proxy exit
+
+        handle.join().unwrap();
+
+        thread::sleep(Duration::from_millis(50));
 
         let events = event::collect_events(rx);
         assert!(events.contains(&Event::ProxyStarted));
@@ -233,31 +459,8 @@ mod tests {
         assert!(events.contains(&Event::AlertStopped));
     }
 
-    #[test]
-    fn proxy_detects_error_completion() {
-        let (sink, rx) = event::channel();
-        let alerter = make_test_alerter(&sink);
-
-        let agent_input = Cursor::new(b"PKDECRYPT\n".to_vec());
-        let scd_input = Cursor::new(b"ERR 100 failed\n".to_vec());
-
-        run_proxy(
-            agent_input,
-            SharedWriter(Arc::new(std::sync::Mutex::new(Vec::new()))),
-            scd_input,
-            SharedWriter(Arc::new(std::sync::Mutex::new(Vec::new()))),
-            alerter,
-            sink,
-        );
-
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        let events = event::collect_events(rx);
-        assert!(events.contains(&Event::TouchCompleted { success: false }));
-    }
-
     /// A Write impl backed by a shared Vec<u8> for testing.
-    struct SharedWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
 
     impl Write for SharedWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {

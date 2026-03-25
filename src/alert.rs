@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::event::{Event, EventSink};
-use crate::sound::{BURST_COUNT, BURST_DELAY_MS, BURST_PAUSE_MS};
+use crate::sound::{BURST_COUNT, BURST_DELAY_MS, BURST_PAUSE_MS, ERROR_SOUND, SUCCESS_SOUND};
 
 /// Handle that stops an alert when dropped.
 pub struct AlertHandle {
@@ -27,6 +27,8 @@ impl Drop for AlertHandle {
 /// Trait for alert implementations. Must be Send + Sync for sharing across threads.
 pub trait Alerter: Send + Sync {
     fn start(&self) -> AlertHandle;
+    /// Play a one-shot sound on operation completion (success or error).
+    fn play_completion(&self, success: bool);
 }
 
 /// macOS alerter using afplay and osascript.
@@ -36,7 +38,21 @@ pub struct MacAlerter {
     pub events: EventSink,
 }
 
+impl MacAlerter {
+    fn play_sound_blocking(sound: &str, volume: &str) {
+        let _ = Command::new("afplay")
+            .args(["-v", volume, sound])
+            .status();
+    }
+}
+
 impl Alerter for MacAlerter {
+    fn play_completion(&self, success: bool) {
+        let sound = if success { SUCCESS_SOUND } else { ERROR_SOUND };
+        // Play synchronously - ensures the sound completes before process exit
+        Self::play_sound_blocking(sound, &self.volume);
+    }
+
     fn start(&self) -> AlertHandle {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
@@ -110,6 +126,10 @@ pub struct RecordingAlerter {
 
 #[cfg(test)]
 impl Alerter for RecordingAlerter {
+    fn play_completion(&self, _success: bool) {
+        // no-op in tests
+    }
+
     fn start(&self) -> AlertHandle {
         self.events.emit(Event::AlertStarted);
         let stop = Arc::new(AtomicBool::new(false));

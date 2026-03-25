@@ -3,6 +3,9 @@ pub const DEFAULT_VOLUME: &str = "2.0";
 pub const BURST_COUNT: usize = 3;
 pub const BURST_DELAY_MS: u64 = 400;
 pub const BURST_PAUSE_MS: u64 = 2000;
+pub const GRACE_PERIOD_MS: u64 = 1000;
+pub const ERROR_SOUND: &str = "/System/Library/Sounds/Basso.aiff";
+pub const SUCCESS_SOUND: &str = "/System/Library/Sounds/Glass.aiff";
 
 pub const SOUNDS: &[&str] = &[
     "/System/Library/Sounds/Funk.aiff",
